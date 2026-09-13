@@ -4,4 +4,7 @@ To run the scanner locally hosted:
 2) python3 -m http.server   (in a dedicated window)
 3) ssh -R 80:localhost:8000 nokey@localhost.run    (in a different dedicated window)
 
+To use the scanner in a web browser:
+https://arnysaknussemm.github.io/UTIC-catalog-number-scanner/
+
 
