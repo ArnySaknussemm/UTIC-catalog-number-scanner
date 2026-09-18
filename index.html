@@ -226,6 +226,10 @@
     border-color:var(--red);
     background:#fdf2f1;
   }
+  .num-input.dup{
+    border-color:var(--brass);
+    background:#fbf3e3;
+  }
   .status-dot{
     display:inline-block;
     width:8px;height:8px;
@@ -234,6 +238,34 @@
   }
   .status-ok .status-dot{background:#3f6b3f;}
   .status-flag .status-dot{background:var(--red);}
+  .status-dup .status-dot{background:var(--brass);}
+  .status-pending .status-dot{background:rgba(27,27,24,0.35);}
+  .attn-badge{
+    display:inline-block;
+    min-width:16px;
+    padding:0 5px;
+    margin-left:5px;
+    border-radius:9px;
+    background:var(--red);
+    color:#fff;
+    font-size:11px;
+    line-height:16px;
+    text-align:center;
+  }
+  .attn-badge[hidden]{display:none;}
+  .dup-note{
+    padding:0 16px 12px;
+    font-size:12.5px;
+    color:#7a5a1f;
+  }
+  .dup-note[hidden]{display:none;}
+  .row-idx{
+    margin-top:3px;
+    text-align:center;
+    font-family:'IBM Plex Mono';
+    font-size:10.5px;
+    color:rgba(27,27,24,0.5);
+  }
   .status-label{font-size:11.5px;color:rgba(27,27,24,0.6);}
   .status-row{margin-top:5px;}
 
@@ -331,7 +363,7 @@
     cursor:pointer;
   }
   .run-btn:disabled{opacity:0.4;cursor:default;}
-  .export-btn{
+  .save-btn{
     background:var(--brass);
     color:var(--ink);
   }
@@ -442,7 +474,7 @@
 
 <header>
   <h1>UTIC Catalog Number Scanner</h1>
-  <button class="review-btn" id="open-drawer">Review <span id="header-count">(0)</span></button>
+  <button class="review-btn" id="open-drawer">Review <span id="header-count">(0)</span><span class="attn-badge" id="header-attn" hidden title="Labels that need a look"></span></button>
 </header>
 
 <main id="capture-main">
@@ -457,7 +489,6 @@
   </div>
 
   <div class="camera-controls">
-    <button class="ghost-btn" id="switch-cam">Flip Camera</button>
     <div class="shutter" id="shutter" title="Capture"></div>
     <button class="ghost-btn" id="upload-trigger">Native Camera</button>
     <input type="file" id="file-input" accept="image/*" capture="environment" multiple hidden />
@@ -483,14 +514,15 @@
       <div class="filmstrip" id="filmstrip"></div>
       <div class="run-bar">
         <button class="run-btn" id="run-ocr" disabled>Re-read all</button>
-        <button class="run-btn export-btn" id="export-csv" disabled>Export CSV</button>
+        <button class="run-btn save-btn" id="save-photos" disabled>Save photos</button>
       </div>
       <div class="run-bar" style="padding-top:0;">
         <button class="run-btn" id="clear-all" style="background:transparent;color:var(--red);border:1px solid var(--red);" disabled>Clear all &amp; start over</button>
       </div>
       <div class="progress-line" id="progress-line"></div>
+      <div class="dup-note" id="dup-note" hidden></div>
       <div id="table-wrap">
-        <div class="empty-note" id="empty-note">No labels captured yet. Go back and take a few photos, then come back here to review, export, or email them.</div>
+        <div class="empty-note" id="empty-note">No labels captured yet. Go back and take a few photos, then come back here to review or email them.</div>
       </div>
     </div>
 
@@ -502,7 +534,7 @@
         <input type="email" id="email-address" placeholder="name@example.com" value="alex.wild@utexas.edu" />
         <button class="run-btn" id="email-btn" disabled>Email list</button>
       </div>
-      <p class="email-note">Opens your phone's mail app with the compiled numbers in the message, ready to send. For long lists, attach the exported CSV instead of relying on the message body.</p>
+      <p class="email-note">Opens your phone's mail app with the compiled numbers in the message, ready to send.</p>
     </div>
 
   </div>
@@ -517,7 +549,6 @@ const state = {
   lastShownId: null,
   zoomMode: 'software', // 'hardware' | 'software'
   zoomValue: 1,
-  processGen: 0,   // bumped to invalidate in-flight OCR when cancelled
 };
 
 // ---------- Local persistence (survives back button, reload, tab close) ----------
@@ -525,8 +556,21 @@ const state = {
 // captured work. This saves after every change and restores on load.
 const STORAGE_KEY = 'utic_scanner_state_v1';
 
+// The preprocessed "debug" image (a big upscaled PNG per photo) is only for the
+// in-session "details" view. It must NOT be persisted: it can be several times
+// the size of the photo itself and used to blow through the storage quota,
+// which forced the photos to be dropped from the saved state.
+function slimResults(){
+  const out = {};
+  for(const id in state.results){
+    const r = state.results[id];
+    out[id] = { rawText: r.rawText, number: r.number, flagged: r.flagged };
+  }
+  return out;
+}
+
 function saveStateToStorage(){
-  const payload = { shots: state.shots, results: state.results };
+  const payload = { shots: state.shots, results: slimResults() };
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   }catch(e){
@@ -535,12 +579,7 @@ function saveStateToStorage(){
     // matters for export/email — and drop the heavier image data.
     try{
       const lightShots = state.shots.map(s => ({ id: s.id, dataUrl: null }));
-      const lightResults = {};
-      for(const id in state.results){
-        const r = state.results[id];
-        lightResults[id] = { rawText: r.rawText, number: r.number, flagged: r.flagged };
-      }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ shots: lightShots, results: lightResults }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ shots: lightShots, results: slimResults() }));
     }catch(e2){
       // Out of options — proceed without persistence rather than break the app.
     }
@@ -576,7 +615,6 @@ const els = {
   zoomSlider: document.getElementById('zoom-slider'),
   zoomLabel: document.getElementById('zoom-label'),
   shutter: document.getElementById('shutter'),
-  switchCam: document.getElementById('switch-cam'),
   uploadTrigger: document.getElementById('upload-trigger'),
   fileInput: document.getElementById('file-input'),
   lastResult: document.getElementById('last-result'),
@@ -584,11 +622,13 @@ const els = {
   closeDrawer: document.getElementById('close-drawer'),
   drawer: document.getElementById('drawer'),
   headerCount: document.getElementById('header-count'),
+  headerAttn: document.getElementById('header-attn'),
+  dupNote: document.getElementById('dup-note'),
   filmstrip: document.getElementById('filmstrip'),
   shotCount: document.getElementById('shot-count'),
   runOcr: document.getElementById('run-ocr'),
+  savePhotos: document.getElementById('save-photos'),
   clearAll: document.getElementById('clear-all'),
-  exportCsv: document.getElementById('export-csv'),
   progressLine: document.getElementById('progress-line'),
   tableWrap: document.getElementById('table-wrap'),
   emptyNote: document.getElementById('empty-note'),
@@ -688,11 +728,6 @@ function showFocusRing(x, y){
   setTimeout(() => els.focusRing.classList.remove('show'), 650);
 }
 
-els.switchCam.addEventListener('click', () => {
-  state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-  startCamera();
-});
-
 els.shutter.addEventListener('click', () => {
   const video = els.video;
   if(!video.videoWidth) return;
@@ -740,37 +775,110 @@ function addShot(dataUrl){
   updateCounts();
   saveStateToStorage();
   showLastResultLoading(shot);
-  processShot(shot);
+  queueOcr(shot);
 }
 function removeShot(id){
+  cancelledIds.add(id); // a queued/in-flight read of this photo should be dropped
+  pendingIds.delete(id);
   state.shots = state.shots.filter(s => s.id !== id);
   delete state.results[id];
   renderFilmstrip();
   renderTable();
-  updateCounts();
+  updateStatusMarks();
   saveStateToStorage();
 }
 function renderFilmstrip(){
   els.filmstrip.innerHTML = '';
   state.shots.forEach(s => {
     const img = document.createElement('img');
-    img.src = s.dataUrl;
+    if(s.dataUrl) img.src = s.dataUrl; // photo may be absent if storage was full on a past session
     img.title = 'Tap to remove';
     img.addEventListener('click', () => removeShot(s.id));
     els.filmstrip.appendChild(img);
   });
 }
-function updateCounts(){
+
+// ---------- Per-label status (OCR confidence + duplicate detection) ----------
+// Maps each non-empty catalog number to the list of shot indexes carrying it,
+// so a label scanned twice (e.g. re-shot after a blurry first try) is caught.
+function getDuplicateMap(){
+  const map = new Map();
+  state.shots.forEach((s, i) => {
+    const r = state.results[s.id];
+    const n = r && r.number;
+    if(!n) return;
+    if(!map.has(n)) map.set(n, []);
+    map.get(n).push(i);
+  });
+  return map;
+}
+// -> { cls: 'ok'|'flag'|'dup'|'pending', text, attention }
+function statusInfo(shot, dupMap, context){
+  const res = state.results[shot.id];
+  if(!res){
+    if(pendingIds.has(shot.id)) return { cls: 'pending', text: 'reading…', attention: false };
+    return { cls: 'flag', text: 'not read yet', attention: true };
+  }
+  const idxs = res.number ? dupMap.get(res.number) : null;
+  if(idxs && idxs.length > 1){
+    const me = state.shots.findIndex(s => s.id === shot.id);
+    const others = idxs.filter(i => i !== me).map(i => '#' + (i + 1));
+    return { cls: 'dup', text: 'duplicate of ' + others.join(', '), attention: true };
+  }
+  if(res.flagged) return { cls: 'flag', text: 'check this one', attention: true };
+  return { cls: 'ok', text: context === 'card' ? 'looks good — next label' : 'looks good', attention: false };
+}
+function applyStatus(wrap, input, info){
+  if(wrap){
+    wrap.classList.remove('status-ok', 'status-flag', 'status-dup', 'status-pending');
+    wrap.classList.add('status-' + info.cls);
+    const label = wrap.querySelector('.status-label');
+    if(label) label.textContent = info.text;
+  }
+  if(input){
+    input.classList.toggle('flagged', info.cls === 'flag');
+    input.classList.toggle('dup', info.cls === 'dup');
+  }
+}
+// Refreshes statuses IN PLACE (no DOM rebuild), so it is safe to call while
+// someone is typing into a number box.
+function updateStatusMarks(){
+  const dupMap = getDuplicateMap();
+  document.querySelectorAll('#table-wrap tr[data-id]').forEach(tr => {
+    const shot = state.shots.find(s => s.id === tr.dataset.id);
+    if(!shot) return;
+    applyStatus(tr.querySelector('.status-wrap'), tr.querySelector('.num-input'), statusInfo(shot, dupMap, 'row'));
+  });
+  const lastShot = state.shots.find(s => s.id === state.lastShownId);
+  if(lastShot && state.results[lastShot.id]){
+    applyStatus(els.lastResult.querySelector('.status-wrap'), els.lastResult.querySelector('.num-input'), statusInfo(lastShot, dupMap, 'card'));
+  }
+  updateCounts(dupMap);
+}
+function updateCounts(dupMap){
+  dupMap = dupMap || getDuplicateMap();
   const n = state.shots.length;
   els.shotCount.textContent = n + (n === 1 ? ' photo' : ' photos');
   els.headerCount.textContent = '(' + n + ')';
   els.runOcr.disabled = n === 0;
+  els.savePhotos.disabled = n === 0;
   els.emailBtn.disabled = n === 0;
-  els.exportCsv.disabled = n === 0;
   els.clearAll.disabled = n === 0;
+
+  // Header badge: how many labels need a look (unclear read or duplicate).
+  const attention = state.shots.filter(s => statusInfo(s, dupMap, 'row').attention).length;
+  els.headerAttn.hidden = attention === 0;
+  els.headerAttn.textContent = attention;
+
+  let dupNumbers = 0;
+  dupMap.forEach(idxs => { if(idxs.length > 1) dupNumbers++; });
+  els.dupNote.hidden = dupNumbers === 0;
+  els.dupNote.textContent = dupNumbers === 0 ? '' :
+    `${dupNumbers} catalog number${dupNumbers === 1 ? ' appears' : 's appear'} more than once — remove the extra photo(s) with × before sending.`;
 }
 els.clearAll.addEventListener('click', () => {
   if(!confirm(`Clear all ${state.shots.length} captured label(s)? This can't be undone.`)) return;
+  state.shots.forEach(s => { cancelledIds.add(s.id); pendingIds.delete(s.id); });
   clearSavedState();
   renderFilmstrip();
   renderTable();
@@ -1109,16 +1217,49 @@ async function ensureWorker(){
   return worker;
 }
 
+// Photos are read strictly ONE AT A TIME through a queue. Previously every new
+// photo started its own read and invalidated the previous one, so scanning
+// labels quickly left the earlier photos permanently "not read yet". Now each
+// photo waits its turn and every one gets a result; cancelling only affects the
+// photo you cancel.
+const CANCELLED = Symbol('cancelled');
+const pendingIds = new Set();   // shots queued or currently being read
+const cancelledIds = new Set(); // shots the user cancelled or removed
+const cancelHooks = new Map();  // shotId -> fn that wakes an in-flight read on cancel
+let currentJobId = null;
+let ocrChain = Promise.resolve();
+
+function queueOcr(shot){
+  cancelledIds.delete(shot.id);
+  pendingIds.add(shot.id);
+  const job = ocrChain.then(() => processShot(shot));
+  ocrChain = job.catch(() => {});
+  return job;
+}
+
 async function processShot(shot){
-  const myGen = ++state.processGen;
+  const stillWanted = () => !cancelledIds.has(shot.id) && state.shots.some(s => s.id === shot.id);
+  if(!stillWanted()){ pendingIds.delete(shot.id); return; }
+
+  currentJobId = shot.id;
+  const cancelPromise = new Promise(resolve => cancelHooks.set(shot.id, () => resolve(CANCELLED)));
+  // Races an async step against cancellation, so a cancelled read (whose
+  // worker may have been terminated and never answers) can't stall the queue.
+  const guard = async (p) => {
+    p.catch(() => {}); // avoid an unhandled rejection from an abandoned step
+    const v = await Promise.race([p, cancelPromise]);
+    if(v === CANCELLED) throw CANCELLED;
+    return v;
+  };
+
+  let result = null;
   try{
-    const w = await ensureWorker();
-    const candidates = await autoCropCandidates(shot.dataUrl); // bottom line first, full photo last
+    const w = await guard(ensureWorker());
+    const candidates = await guard(autoCropCandidates(shot.dataUrl)); // bottom line first, full photo last
 
     let best = null; // best result seen so far, in case nothing gets a strict match
     for(const cand of candidates){
-      if(myGen !== state.processGen) return; // cancelled or superseded — abandon quietly
-      const ocrInput = await preprocessForOCR(cand.dataUrl, !cand.cropped);
+      const ocrInput = await guard(preprocessForOCR(cand.dataUrl, !cand.cropped));
 
       if(cand.cropped){
         // A tight per-line autocrop is almost certainly just the number now —
@@ -1126,14 +1267,13 @@ async function processShot(shot){
         // This whitelist would be too risky on a full uncropped photo (nearby
         // letters could get misread as stray digits), but is safe once we're
         // confident the crop excludes the label's other text.
-        await w.setParameters({ tessedit_pageseg_mode: '7', tessedit_char_whitelist: '0123456789' });
+        await guard(w.setParameters({ tessedit_pageseg_mode: '7', tessedit_char_whitelist: '0123456789' }));
       } else {
         // Full photo fallback: treat as one general block of text, no whitelist.
-        await w.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '' });
+        await guard(w.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '' }));
       }
 
-      const { data } = await w.recognize(ocrInput);
-      if(myGen !== state.processGen) return; // cancelled mid-recognize — discard this result
+      const { data } = await guard(w.recognize(ocrInput));
       const parsed = parseLabel(data.text || '');
       parsed.rawText = (cand.cropped ? '[auto-cropped line candidate]\n' : '[no crop applied — used full photo]\n') + parsed.rawText;
       parsed.debugImage = ocrInput;
@@ -1150,46 +1290,59 @@ async function processShot(shot){
         best = parsed;
       }
     }
-
-    if(myGen !== state.processGen) return; // cancelled while finishing up
-    state.results[shot.id] = best || { rawText: '(no text found)', number: '', flagged: true };
+    result = best || { rawText: '(no text found)', number: '', flagged: true };
   }catch(err){
-    if(myGen !== state.processGen) return; // this error is a side effect of cancellation — ignore it
-    state.results[shot.id] = { rawText: '(OCR failed: ' + err.message + ')', number: '', flagged: true };
+    if(err !== CANCELLED){
+      result = { rawText: '(OCR failed: ' + (err && err.message ? err.message : err) + ')', number: '', flagged: true };
+    }
+  }finally{
+    cancelHooks.delete(shot.id);
+    if(currentJobId === shot.id) currentJobId = null;
+    pendingIds.delete(shot.id);
   }
+
+  if(!result || !stillWanted()) return; // cancelled, or the photo was removed meanwhile
+  state.results[shot.id] = result;
   renderTable();
-  updateCounts();
+  updateStatusMarks();
   saveStateToStorage();
   showLastResult(shot);
 }
 
-// Genuinely stops in-flight OCR (not just hiding it in the UI) by terminating
-// the Tesseract worker outright — a fresh one spins up automatically for the
-// next shot. Useful if processing seems stuck or you want to retake instead
-// of waiting.
-async function cancelCurrentProcessing(){
-  state.processGen++; // invalidates any in-flight processShot immediately
-  const shotId = state.lastShownId;
-  if(worker){
-    try{ await worker.terminate(); }catch(e){}
-    worker = null;
+// Genuinely stops an in-flight read (not just hiding it in the UI). If this
+// photo is the one being read right now, the Tesseract worker is terminated
+// outright — a fresh one spins up automatically for the next photo. If it is
+// still waiting in the queue, it is simply skipped.
+async function cancelProcessing(shotId){
+  cancelledIds.add(shotId);
+  const wasRunning = currentJobId === shotId;
+  const hook = cancelHooks.get(shotId);
+  if(hook) hook();
+  let dying = null;
+  if(wasRunning && worker){
+    dying = worker;
+    worker = null; // set synchronously so the next queued photo builds a fresh worker
   }
-  if(shotId){
+  pendingIds.delete(shotId);
+  if(state.shots.some(s => s.id === shotId)){
     state.results[shotId] = { rawText: '(cancelled — retake this label)', number: '', flagged: true };
     saveStateToStorage();
     renderTable();
+    updateStatusMarks();
     const shot = state.shots.find(s => s.id === shotId);
     if(shot) showLastResult(shot);
   }
+  if(dying){ try{ await dying.terminate(); }catch(e){} }
 }
 
 async function runAllOcr(){
   els.runOcr.disabled = true;
+  const shots = [...state.shots];
   els.progressLine.textContent = 'Re-reading all photos…';
   let done = 0;
-  for(const shot of state.shots){
-    els.progressLine.textContent = `Reading photo ${done + 1} of ${state.shots.length}…`;
-    await processShot(shot);
+  for(const shot of shots){
+    els.progressLine.textContent = `Reading photo ${done + 1} of ${shots.length}…`;
+    if(state.shots.some(s => s.id === shot.id)) await queueOcr(shot);
     done++;
   }
   els.progressLine.textContent = `Done — read ${done} photo${done === 1 ? '' : 's'}.`;
@@ -1202,14 +1355,14 @@ function showLastResultLoading(shot){
   state.lastShownId = shot.id;
   els.lastResult.classList.remove('placeholder');
   els.lastResult.innerHTML = `
-    <img src="${shot.dataUrl}" />
+    ${shot.dataUrl ? `<img src="${shot.dataUrl}" />` : ''}
     <div class="last-result-body">
       <div class="status-label">Reading label&hellip;</div>
       <button class="ghost-btn" id="cancel-processing-btn" style="margin-top:6px;">Cancel &amp; retake</button>
     </div>
   `;
   const cancelBtn = document.getElementById('cancel-processing-btn');
-  if(cancelBtn) cancelBtn.addEventListener('click', cancelCurrentProcessing);
+  if(cancelBtn) cancelBtn.addEventListener('click', () => cancelProcessing(shot.id));
 }
 function showLastResult(shot){
   if(state.lastShownId !== shot.id) return; // a newer shot has already taken over the card
@@ -1218,26 +1371,27 @@ function showLastResult(shot){
   els.lastResult.innerHTML = '';
 
   const img = document.createElement('img');
-  img.src = shot.dataUrl;
+  if(shot.dataUrl) img.src = shot.dataUrl;
 
   const body = document.createElement('div');
   body.className = 'last-result-body';
 
   const input = document.createElement('input');
-  input.className = 'num-input' + (res.flagged ? ' flagged' : '');
+  input.className = 'num-input';
   input.value = res.number;
   input.placeholder = 'not read';
   input.addEventListener('input', () => {
     state.results[shot.id].number = input.value.trim();
     state.results[shot.id].flagged = false;
-    input.classList.remove('flagged');
     renderTable();
+    updateStatusMarks(); // re-checks flag/duplicate state in place, keeping focus in this box
     saveStateToStorage();
   });
 
   const statusRow = document.createElement('div');
-  statusRow.className = 'status-row ' + (res.flagged ? 'status-flag' : 'status-ok');
-  statusRow.innerHTML = `<span class="status-dot"></span><span class="status-label">${res.flagged ? 'check this one' : 'looks good — next label'}</span>`;
+  statusRow.className = 'status-row status-wrap';
+  statusRow.innerHTML = `<span class="status-dot"></span><span class="status-label"></span>`;
+  applyStatus(statusRow, input, statusInfo(shot, getDuplicateMap(), 'card'));
 
   body.appendChild(input);
   body.appendChild(statusRow);
@@ -1262,38 +1416,43 @@ function renderTable(){
     </tr></thead>
   `;
   const tbody = document.createElement('tbody');
+  const dupMap = getDuplicateMap();
 
-  state.shots.forEach((shot) => {
+  state.shots.forEach((shot, rowIndex) => {
     const res = state.results[shot.id];
     const tr = document.createElement('tr');
+    tr.dataset.id = shot.id;
 
     const thumbTd = document.createElement('td');
     thumbTd.className = 'thumb-cell';
     const img = document.createElement('img');
-    img.src = shot.dataUrl;
+    if(shot.dataUrl) img.src = shot.dataUrl;
     thumbTd.appendChild(img);
+    const idx = document.createElement('div');
+    idx.className = 'row-idx';
+    idx.textContent = '#' + (rowIndex + 1);
+    thumbTd.appendChild(idx);
 
     const numTd = document.createElement('td');
     const input = document.createElement('input');
-    input.className = 'num-input' + (res && res.flagged ? ' flagged' : '');
+    input.className = 'num-input';
     input.value = res ? res.number : '';
     input.placeholder = res ? '—' : 'not read';
     input.addEventListener('input', () => {
       if(!state.results[shot.id]) state.results[shot.id] = { rawText:'', number:'', flagged:false };
       state.results[shot.id].number = input.value.trim();
       state.results[shot.id].flagged = false;
-      input.classList.remove('flagged');
       if(state.lastShownId === shot.id) showLastResult(shot);
+      updateStatusMarks(); // in place: no rebuild, so typing keeps focus
       saveStateToStorage();
     });
     numTd.appendChild(input);
 
     const statusTd = document.createElement('td');
     const statusWrap = document.createElement('div');
-    statusWrap.className = res && !res.flagged ? 'status-ok' : 'status-flag';
-    statusWrap.innerHTML = `<span class="status-dot"></span><span class="status-label">${
-      !res ? 'not read yet' : (res.flagged ? 'check this one' : 'looks good')
-    }</span>`;
+    statusWrap.className = 'status-wrap';
+    statusWrap.innerHTML = `<span class="status-dot"></span><span class="status-label"></span>`;
+    applyStatus(statusWrap, input, statusInfo(shot, dupMap, 'row'));
     statusTd.appendChild(statusWrap);
     if(res && res.rawText){
       const toggle = document.createElement('button');
@@ -1335,27 +1494,98 @@ function renderTable(){
   els.tableWrap.appendChild(table);
 }
 
-// ---------- Export ----------
-els.exportCsv.addEventListener('click', () => {
-  const rows = [['index', 'catalog_number', 'needs_review', 'raw_ocr_text']];
-  state.shots.forEach((shot, idx) => {
-    const res = state.results[shot.id] || { number:'', flagged:true, rawText:'' };
-    rows.push([
-      idx + 1,
-      res.number,
-      res.flagged ? 'yes' : 'no',
-      '"' + (res.rawText || '').replace(/"/g,'""').replace(/\n/g,' ') + '"'
-    ]);
+// ---------- Save photos ----------
+// Photos otherwise live only inside the browser's storage, with no way out.
+// This hands them to the phone's share sheet (Photos / Files / AirDrop / Drive
+// on iPhone and Android) so they can be kept, e.g. as a test set for tuning
+// the OCR. Each file is named after the catalog number shown for it; anything
+// unread or flagged is prefixed "check-" so a wrong name is easy to spot.
+const EXT_FOR_MIME = { 'image/jpeg':'jpg', 'image/png':'png', 'image/webp':'webp', 'image/heic':'heic', 'image/heif':'heif' };
+let preparedPhotoFiles = null; // built on a first tap when a browser wants a fresh tap to share
+
+function photoFileBaseNames(shots){
+  const taken = new Map();
+  return shots.map((s, i) => {
+    const r = state.results[s.id];
+    const num = r && r.number ? String(r.number).replace(/[^A-Za-z0-9_-]/g, '') : '';
+    let base;
+    if(num && !r.flagged) base = num;
+    else base = 'check-' + (num || 'unread') + '-' + (state.shots.indexOf(s) + 1);
+    const count = (taken.get(base) || 0) + 1;
+    taken.set(base, count);
+    return count === 1 ? base : base + '_' + count; // the same number twice -> 123456, 123456_2
   });
-  const csv = rows.map(r => r.join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'insect_labels.csv';
-  a.click();
-  URL.revokeObjectURL(url);
-});
+}
+function dataUrlToFileSync(dataUrl, baseName){
+  const m = /^data:([^;,]+)(;base64)?,/.exec(dataUrl);
+  if(!m) return null;
+  const mime = m[1];
+  const raw = dataUrl.slice(m[0].length);
+  const bin = m[2] ? atob(raw) : decodeURIComponent(raw);
+  const bytes = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], baseName + '.' + (EXT_FOR_MIME[mime] || 'jpg'), { type: mime });
+}
+function buildPhotoFiles(){
+  const shots = state.shots.filter(s => s.dataUrl);
+  const names = photoFileBaseNames(shots);
+  return shots.map((s, i) => dataUrlToFileSync(s.dataUrl, names[i])).filter(Boolean);
+}
+function downloadFilesOneByOne(files){
+  files.forEach((file, i) => {
+    setTimeout(() => {
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }, i * 350);
+  });
+}
+async function savePhotos(){
+  const total = state.shots.length;
+  let files = preparedPhotoFiles;
+  preparedPhotoFiles = null;
+  els.savePhotos.textContent = 'Save photos';
+  if(!files){
+    els.progressLine.textContent = 'Preparing photos…';
+    files = buildPhotoFiles();
+  }
+  if(files.length === 0){
+    els.progressLine.textContent = 'No photo data to save — photos are dropped after a reload if the browser ran out of storage.';
+    return;
+  }
+  const missing = total - files.length;
+  const noteMissing = missing > 0 ? ` (${missing} had no photo data)` : '';
+
+  if(navigator.canShare && navigator.canShare({ files })){
+    try{
+      await navigator.share({ files, title: 'UTIC label photos' });
+      els.progressLine.textContent = `Shared ${files.length} photo${files.length === 1 ? '' : 's'}${noteMissing}.`;
+    }catch(err){
+      if(err && err.name === 'AbortError'){
+        els.progressLine.textContent = 'Save cancelled.';
+      } else if(err && err.name === 'NotAllowedError'){
+        // Some browsers only allow the share sheet right after a tap, and the
+        // preparation took too long. The files are ready now, so one more tap works.
+        preparedPhotoFiles = files;
+        els.savePhotos.textContent = `Share ${files.length} photo${files.length === 1 ? '' : 's'}`;
+        els.progressLine.textContent = 'Photos are ready — tap the button again to share them.';
+      } else {
+        els.progressLine.textContent = 'Sharing failed (' + (err && err.message ? err.message : err) + ') — downloading instead.';
+        downloadFilesOneByOne(files);
+      }
+    }
+  } else {
+    // No file sharing here (e.g. a desktop browser): download them one by one.
+    downloadFilesOneByOne(files);
+    els.progressLine.textContent = `Downloading ${files.length} photo${files.length === 1 ? '' : 's'}${noteMissing}…`;
+  }
+}
+els.savePhotos.addEventListener('click', savePhotos);
 
 // ---------- Email ----------
 function buildListText(){
@@ -1381,16 +1611,25 @@ els.emailBtn.addEventListener('click', () => {
 
 // ---------- Init ----------
 loadStateFromStorage();
+// Photos that were still waiting to be read when the page was closed/reloaded
+// get picked back up (only possible if the photo itself was saved).
+state.shots.forEach(s => {
+  if(!state.results[s.id] && s.dataUrl) pendingIds.add(s.id);
+});
 renderFilmstrip();
 renderTable();
-updateCounts();
+updateStatusMarks();
 if(state.shots.length > 0){
   // Show the most recently captured shot in the last-result card so it's
   // clear the restored session picked up right where it left off.
   const latest = state.shots[state.shots.length - 1];
+  state.lastShownId = latest.id;
   if(state.results[latest.id]) showLastResult(latest);
   else showLastResultLoading(latest);
 }
+state.shots.forEach(s => {
+  if(!state.results[s.id] && s.dataUrl) queueOcr(s);
+});
 startCamera();
 
 // Best-effort warning if the browser supports it — not guaranteed on mobile,
